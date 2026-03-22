@@ -1,6 +1,6 @@
 # git-autopush
 
-Automated git add, commit, and push for managed repositories — designed for backing up service configurations across servers.
+Automated git add, commit, and push for managed repositories — with automatic sub-repo discovery. Designed for backing up service configurations across servers.
 
 ## Install
 
@@ -32,8 +32,9 @@ Re-runnable — updates the script and systemd units without overwriting your co
 ## Usage
 
 ```bash
-usr/local/bin        # Run immediately
-sudo git-autopush list            # Show configured repos and their status
+sudo git-autopush manual          # Run immediately
+sudo git-autopush list            # Show configured repos with parent/child relationships
+sudo git-autopush discover        # Scan for sub-repos and add them
 sudo git-autopush auto            # What the timer calls (same as manual, different log label)
 ```
 
@@ -60,19 +61,15 @@ journalctl -u git-autopush.service
 
 ```bash
 # Schedule — systemd OnCalendar format
-# Examples: weekly, daily, hourly, *-*-* 03:00, Mon *-*-* 02:00
 SCHEDULE="weekly"
 
 # Log file path
 LOG_FILE="/var/log/git-autopush/git-autopush.log"
 
-# Commit message template
-# Placeholders: {hostname}, {date}, {path}
+# Commit message template — placeholders: {hostname}, {date}, {path}
 COMMIT_MSG_TEMPLATE="auto-backup: {hostname} {date}"
 
-# How to handle repos with uncommitted changes:
-#   commit — stage everything and commit (default, safest for backups)
-#   skip   — leave dirty repos alone
+# How to handle repos with uncommitted changes: commit | skip
 DIRTY_POLICY="commit"
 
 # Push retry settings
@@ -81,6 +78,12 @@ PUSH_RETRY_DELAY=10
 
 # SSH key for git push (leave empty to use default SSH config)
 SSH_KEY="/home/loopey/.ssh/github_hw_raider"
+
+# Auto-discover nested git repos under configured parent paths
+AUTO_DISCOVER="true"
+
+# Max directory depth to scan for nested repos
+DISCOVER_DEPTH=3
 ```
 
 After changing `SCHEDULE`, re-run the installer to update the systemd timer:
@@ -97,64 +100,68 @@ One repo per line, pipe-delimited:
 # path | remote | branch
 /opt              | origin | main
 /srv/another-app  | origin | master
-/home/user/dotfiles | backup | main
+
+# auto-discovered 2026-03-22
+/opt/git-autopush | origin | main
 ```
 
-The installer auto-detects `/opt/.git` and adds it on first run.
+The installer auto-detects `/opt/.git` on first run. Sub-repos are added automatically when `AUTO_DISCOVER="true"`.
 
-## Discovering Repos
+## Sub-Repo Discovery
 
-Use `discover.sh` to scan a directory tree for git repos and add them to `repos.conf` in bulk.
+git-autopush automatically detects nested git repositories inside configured parent repos.
+
+### How it works
+
+1. On each run (or via `discover`), scans configured parent repo paths for nested `.git` directories
+2. For each child repo found with a remote and branch:
+   - Adds it to `repos.conf` (with `# auto-discovered` comment)
+   - Updates the parent's `.gitignore` to exclude the child directory
+3. Processing order is **children first, parents last** — child repos get committed/pushed before the parent sees them as clean
+
+### Example
+
+Given this structure:
+```
+/opt/                  ← parent repo (origin → HW-Raider_Opt)
+├── git-autopush/      ← child repo (origin → HW-Git_Autopush)
+├── jellyfin/
+└── adguardhome/
+```
+
+Running `sudo git-autopush manual` will:
+1. Discover `/opt/git-autopush` as a child of `/opt`
+2. Add `git-autopush/` to `/opt/.gitignore`
+3. Commit and push `/opt/git-autopush` first
+4. Then commit and push `/opt` (which now only tracks its own files)
+
+### Manual discovery
 
 ```bash
-bash discover.sh                     # Interactive prompt for directory to scan
-bash discover.sh -d /home/user       # Scan specific directory (no prompt)
-bash discover.sh -q                  # Quiet mode — scan current dir, no directory prompt
-bash discover.sh -y /srv             # Auto-add all repos, no prompts
-bash discover.sh -k ~/.ssh/my_key    # Override SSH key
+sudo git-autopush discover
 ```
 
-### What it does
+Output:
+```
+=== Discovery scan ===
+  DISCOVERED: /opt/git-autopush|origin|main (added to repos.conf, parent .gitignore updated)
+  Discovery: 1 sub-repo(s) found, 1 new added
 
-1. Recursively scans the target directory for `.git` folders
-2. Filters out repos already in `repos.conf`
-3. Presents an interactive multi-select menu (all selected by default)
-   - Arrow keys to navigate, Space to toggle, A = all, N = none, Enter to confirm
-   - Falls back to a numbered list in non-interactive terminals
-4. Auto-detects the remote (`origin` preferred) and current branch for each repo
-5. Appends selected repos to `/etc/git-autopush/repos.conf`
-6. Offers to set `SSH_KEY` in config if not already configured
+Current repos:
+  /opt                            origin/main  [OK]
+  /opt/git-autopush               origin/main  [OK] (child of /opt)
+```
 
-### SSH key auto-detection
+### Disabling
 
-The script checks these locations in order:
-
-1. `SSH_KEY` already set in `/etc/git-autopush/config`
-2. `-i` key from `GIT_SSH_COMMAND` environment variable
-3. Keys loaded in `ssh-agent`
-4. `~/.ssh/` — github-named keys first, then `id_ed25519`, `id_rsa`, etc.
+Set `AUTO_DISCOVER="false"` in `/etc/git-autopush/config` to manage repos manually.
 
 ## Dirty Repo Handling
 
 | Policy | Behavior |
 |--------|----------|
-| `commit` | Stages all changes with `git add -A`, commits with the configured message template, then pushes. This is the default and safest option for backup purposes. |
-| `skip` | Leaves the repo untouched if there are uncommitted changes. Useful if you want manual control over commits. |
-
-## How It Works
-
-1. Acquires a lock file (`/run/git-autopush/git-autopush.lock`) to prevent overlapping runs
-2. Reads repos from `/etc/git-autopush/repos.conf`
-3. For each repo:
-   - Validates it's a git repo with the expected remote
-   - Checks for dirty working tree, applies `DIRTY_POLICY`
-   - Counts commits ahead of remote
-   - Pushes with retry logic
-4. Logs everything to the log file and stdout/journal
-
-## Log Rotation
-
-Handled by logrotate — weekly rotation, 12 weeks retained, compressed with delayed compression.
+| `commit` | Stages all changes with `git add -A`, commits with the configured message template, then pushes. Default and safest for backups. |
+| `skip` | Leaves the repo untouched if there are uncommitted changes. |
 
 ## Deploying to Another Server
 
@@ -162,4 +169,5 @@ Handled by logrotate — weekly rotation, 12 weeks retained, compressed with del
 2. On the new server, set up your git repo(s) and SSH keys
 3. Run: `sudo bash /tmp/install.sh`
 4. Edit `/etc/git-autopush/repos.conf` to list the repos on that server
-5. Update `SSH_KEY` in `/etc/git-autopush/config` if needed
+5. Update `SSH_KEY` in `/etc/git-autopush/config`
+6. Any nested repos will be auto-discovered on the first run

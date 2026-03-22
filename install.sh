@@ -260,12 +260,12 @@ build_msg() {
 
 # --- Push with retries ------------------------------------------------------
 try_push() {
-    local repo_path="$1" remote="$2" branch="$3"
+    local repo_path="$1" remote="$2" branch="$3" gcmd="${4:-git}"
     local attempt=0 rc
     while (( attempt < PUSH_RETRIES )); do
         (( attempt++ ))
         local output
-        output=$(git -C "$repo_path" push "$remote" "$branch" 2>&1) && rc=0 || rc=$?
+        output=$($gcmd -C "$repo_path" push "$remote" "$branch" 2>&1) && rc=0 || rc=$?
         echo "$output" >> "$LOG_FILE" 2>/dev/null
         echo "$output"
         if [[ $rc -eq 0 ]]; then
@@ -290,23 +290,35 @@ process_repo() {
         return 1
     fi
 
+    # If running as root, determine repo owner and run git ops as that user
+    local git_cmd="git"
+    if [[ $EUID -eq 0 ]]; then
+        local repo_owner
+        repo_owner=$(stat -c '%U' "$repo_path")
+        if [[ "$repo_owner" != "root" ]]; then
+            git_cmd="sudo -u $repo_owner git"
+        fi
+        git config --global --get-all safe.directory | grep -qxF "$repo_path" 2>/dev/null || \
+            git config --global --add safe.directory "$repo_path"
+    fi
+
     # Check remote exists
-    if ! git -C "$repo_path" remote | grep -qx "$remote"; then
+    if ! $git_cmd -C "$repo_path" remote | grep -qx "$remote"; then
         log "  ERROR: remote '${remote}' not found — skipping"
         return 1
     fi
 
     # Handle dirty working tree
-    status_count=$(git -C "$repo_path" status --porcelain 2>/dev/null | wc -l)
+    status_count=$($git_cmd -C "$repo_path" status --porcelain 2>/dev/null | wc -l)
     if (( status_count > 0 )); then
         log "  Found ${status_count} changed/untracked files"
         case "$DIRTY_POLICY" in
             commit)
                 log "  Policy: commit — staging all changes"
-                git -C "$repo_path" add -A >> "$LOG_FILE" 2>&1
+                $git_cmd -C "$repo_path" add -A >> "$LOG_FILE" 2>&1
                 local msg commit_output commit_rc
                 msg=$(build_msg "$repo_path")
-                commit_output=$(git -C "$repo_path" commit -m "$msg" 2>&1) && commit_rc=0 || commit_rc=$?
+                commit_output=$($git_cmd -C "$repo_path" commit -m "$msg" 2>&1) && commit_rc=0 || commit_rc=$?
                 echo "$commit_output" >> "$LOG_FILE" 2>/dev/null
                 echo "$commit_output"
                 if [[ $commit_rc -ne 0 ]]; then
@@ -328,14 +340,14 @@ process_repo() {
 
     # Check if there are commits to push
     local ahead
-    ahead=$(git -C "$repo_path" rev-list --count "${remote}/${branch}..HEAD" 2>/dev/null || echo "0")
+    ahead=$($git_cmd -C "$repo_path" rev-list --count "${remote}/${branch}..HEAD" 2>/dev/null || echo "0")
     if (( ahead == 0 )); then
         log "  Already up-to-date with ${remote}/${branch}"
         return 0
     fi
 
     log "  Pushing ${ahead} commit(s) to ${remote}/${branch}"
-    if try_push "$repo_path" "$remote" "$branch"; then
+    if try_push "$repo_path" "$remote" "$branch" "$git_cmd"; then
         log "  Push successful"
     else
         log "  ERROR: push failed after ${PUSH_RETRIES} attempts"
