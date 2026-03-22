@@ -32,7 +32,7 @@ Re-runnable — updates the script and systemd units without overwriting your co
 ## Usage
 
 ```bash
-sudo git-autopush manual          # Run immediately
+usr/local/bin        # Run immediately
 sudo git-autopush list            # Show configured repos and their status
 sudo git-autopush auto            # What the timer calls (same as manual, different log label)
 ```
@@ -101,6 +101,38 @@ One repo per line, pipe-delimited:
 ```
 
 The installer auto-detects `/opt/.git` and adds it on first run.
+
+## Discovering Repos
+
+Use `discover.sh` to scan a directory tree for git repos and add them to `repos.conf` in bulk.
+
+```bash
+bash discover.sh                     # Interactive prompt for directory to scan
+bash discover.sh -d /home/user       # Scan specific directory (no prompt)
+bash discover.sh -q                  # Quiet mode — scan current dir, no directory prompt
+bash discover.sh -y /srv             # Auto-add all repos, no prompts
+bash discover.sh -k ~/.ssh/my_key    # Override SSH key
+```
+
+### What it does
+
+1. Recursively scans the target directory for `.git` folders
+2. Filters out repos already in `repos.conf`
+3. Presents an interactive multi-select menu (all selected by default)
+   - Arrow keys to navigate, Space to toggle, A = all, N = none, Enter to confirm
+   - Falls back to a numbered list in non-interactive terminals
+4. Auto-detects the remote (`origin` preferred) and current branch for each repo
+5. Appends selected repos to `/etc/git-autopush/repos.conf`
+6. Offers to set `SSH_KEY` in config if not already configured
+
+### SSH key auto-detection
+
+The script checks these locations in order:
+
+1. `SSH_KEY` already set in `/etc/git-autopush/config`
+2. `-i` key from `GIT_SSH_COMMAND` environment variable
+3. Keys loaded in `ssh-agent`
+4. `~/.ssh/` — github-named keys first, then `id_ed25519`, `id_rsa`, etc.
 
 ## Dirty Repo Handling
 
