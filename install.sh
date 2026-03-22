@@ -46,6 +46,7 @@ install_script() {
 #!/usr/bin/env bash
 # ============================================================================
 # git-autopush — automated git add / commit / push for managed repos
+#                with automatic sub-repo discovery
 # ============================================================================
 set -uo pipefail
 
@@ -61,6 +62,8 @@ DIRTY_POLICY="commit"    # commit | skip
 PUSH_RETRIES=3
 PUSH_RETRY_DELAY=10
 SSH_KEY=""                # set in config or GIT_SSH_COMMAND env
+AUTO_DISCOVER="true"      # auto-discover nested git repos
+DISCOVER_DEPTH=3          # max directory depth to scan for nested repos
 
 # --- Helpers ----------------------------------------------------------------
 ts()   { date '+%Y-%m-%d %H:%M:%S'; }
@@ -97,6 +100,152 @@ acquire_lock() {
         rm -f "$LOCK_FILE"
     fi
     echo $$ > "$LOCK_FILE"
+}
+
+# --- Read configured repo paths (just the paths) ---------------------------
+configured_paths() {
+    grep -v '^\s*#' "$REPOS_FILE" 2>/dev/null | grep -v '^\s*$' | while IFS='|' read -r p _; do
+        echo "$p" | xargs
+    done
+}
+
+# --- Check if a path is already in repos.conf ------------------------------
+is_configured() {
+    local needle="$1"
+    configured_paths | grep -qxF "$needle"
+}
+
+# --- Discover nested git repos under a parent path -------------------------
+discover_subrepos() {
+    local parent_path="$1"
+    local max_depth="${DISCOVER_DEPTH:-3}"
+
+    [[ -d "$parent_path" ]] || return
+
+    # Find .git directories under parent, excluding parent itself
+    while IFS= read -r gitdir; do
+        local repo_dir
+        repo_dir=$(dirname "$gitdir")
+        # Skip the parent itself
+        [[ "$repo_dir" == "$parent_path" ]] && continue
+        # Must have at least one remote
+        local remote branch
+        remote=$(git -C "$repo_dir" remote 2>/dev/null | head -1)
+        branch=$(git -C "$repo_dir" branch --show-current 2>/dev/null)
+        if [[ -n "$remote" && -n "$branch" ]]; then
+            echo "${repo_dir}|${remote}|${branch}"
+        fi
+    done < <(find "$parent_path" -maxdepth "$max_depth" -name ".git" -type d 2>/dev/null | sort)
+}
+
+# --- Add a discovered repo to repos.conf -----------------------------------
+add_to_repos_conf() {
+    local entry="$1"
+    local repo_path
+    repo_path=$(echo "$entry" | cut -d'|' -f1)
+    if ! is_configured "$repo_path"; then
+        echo "# auto-discovered $(date '+%Y-%m-%d')" >> "$REPOS_FILE"
+        echo "$entry" >> "$REPOS_FILE"
+        return 0
+    fi
+    return 1
+}
+
+# --- Ensure parent .gitignore excludes a child repo directory ---------------
+ensure_parent_ignores_child() {
+    local parent_path="$1" child_path="$2"
+    local relative gitignore_path
+
+    # Build relative path from parent to child
+    relative="${child_path#"${parent_path}"/}"
+    # Only the top-level directory name relative to parent
+    local child_dir="${relative%%/*}"
+    [[ -z "$child_dir" ]] && child_dir="$relative"
+    # Trailing slash for directory match
+    local ignore_entry="${child_dir}/"
+    gitignore_path="${parent_path}/.gitignore"
+
+    # Check if already ignored
+    if [[ -f "$gitignore_path" ]]; then
+        if grep -qxF "$ignore_entry" "$gitignore_path" 2>/dev/null; then
+            return 0   # already present
+        fi
+        # Also check without trailing slash
+        if grep -qxF "$child_dir" "$gitignore_path" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    # Add the ignore entry
+    {
+        echo ""
+        echo "# Auto-excluded: child repo has its own git remote"
+        echo "$ignore_entry"
+    } >> "$gitignore_path"
+    return 0
+}
+
+# --- Find parent repo for a child path ------------------------------------
+find_parent_repo() {
+    local child_path="$1"
+    local candidate="$child_path"
+    while true; do
+        candidate=$(dirname "$candidate")
+        [[ "$candidate" == "/" || "$candidate" == "." ]] && return 1
+        if [[ -d "${candidate}/.git" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+}
+
+# --- Run discovery: scan all configured repos for children -----------------
+run_discovery() {
+    local quiet="${1:-false}"
+    local found=0 added=0
+
+    [[ -f "$REPOS_FILE" ]] || return
+
+    # Collect current parent paths (we only scan repos already in the config)
+    local -a parents=()
+    while IFS= read -r p; do
+        [[ -d "${p}/.git" ]] && parents+=("$p")
+    done < <(configured_paths)
+
+    for parent in "${parents[@]}"; do
+        while IFS= read -r entry; do
+            [[ -z "$entry" ]] && continue
+            local child_path
+            child_path=$(echo "$entry" | cut -d'|' -f1)
+            (( found++ ))
+
+            if add_to_repos_conf "$entry"; then
+                (( added++ ))
+                # Ensure parent ignores the child directory
+                ensure_parent_ignores_child "$parent" "$child_path"
+                if [[ "$quiet" != "true" ]]; then
+                    log "  DISCOVERED: ${entry} (added to repos.conf, parent .gitignore updated)"
+                fi
+            else
+                if [[ "$quiet" != "true" ]]; then
+                    logn "  Already configured: ${child_path}"
+                fi
+            fi
+        done < <(discover_subrepos "$parent")
+    done
+
+    if [[ "$quiet" != "true" ]]; then
+        log "  Discovery: ${found} sub-repo(s) found, ${added} new added"
+    fi
+}
+
+# --- Build sorted repo list (children before parents) ----------------------
+build_repo_list() {
+    # Read all entries, sort by path length descending (longest = deepest first)
+    grep -v '^\s*#' "$REPOS_FILE" 2>/dev/null | grep -v '^\s*$' | \
+        awk -F'|' '{ gsub(/^[ \t]+|[ \t]+$/, "", $1); print length($1), $0 }' | \
+        sort -t' ' -k1 -rn | \
+        cut -d' ' -f2-
 }
 
 # --- Build commit message ---------------------------------------------------
@@ -196,21 +345,47 @@ process_repo() {
 
 # --- Main -------------------------------------------------------------------
 main() {
-    local mode="${1:-auto}"   # auto (from timer) | manual | list
+    local mode="${1:-auto}"   # auto (from timer) | manual | list | discover
     load_config
 
     case "$mode" in
         list)
             echo "Configured repos (${REPOS_FILE}):"
             echo "---"
+            # Build a set of configured paths for parent lookups
+            local -a cfg_paths=()
+            while IFS= read -r cp; do
+                cfg_paths+=("$cp")
+            done < <(configured_paths)
+
             grep -v '^\s*#' "$REPOS_FILE" | grep -v '^\s*$' | while IFS='|' read -r path remote branch _; do
                 path=$(echo "$path" | xargs)
                 remote=$(echo "$remote" | xargs)
                 branch=$(echo "$branch" | xargs)
                 local status="OK"
                 [[ -d "${path}/.git" ]] || status="NOT A GIT REPO"
-                printf "  %-30s  %s/%s  [%s]\n" "$path" "$remote" "$branch" "$status"
+                # Check if it's a child of another configured repo
+                local relation=""
+                local parent
+                parent=$(find_parent_repo "$path" 2>/dev/null) || true
+                if [[ -n "$parent" ]]; then
+                    for cp in "${cfg_paths[@]}"; do
+                        if [[ "$cp" == "$parent" ]]; then
+                            relation=" (child of ${parent})"
+                            break
+                        fi
+                    done
+                fi
+                printf "  %-30s  %s/%s  [%s]%s\n" "$path" "$remote" "$branch" "$status" "$relation"
             done
+            return 0
+            ;;
+        discover)
+            log "=== Discovery scan ==="
+            run_discovery "false"
+            echo ""
+            echo "Current repos:"
+            main list
             return 0
             ;;
         manual)
@@ -225,9 +400,15 @@ main() {
 
     [[ -f "$REPOS_FILE" ]] || { log "ERROR: repos file not found: $REPOS_FILE"; exit 1; }
 
+    # Auto-discover sub-repos if enabled
+    if [[ "${AUTO_DISCOVER:-true}" == "true" ]]; then
+        log "--- Running sub-repo discovery..."
+        run_discovery "false"
+    fi
+
+    # Process repos: children first (sorted by path depth, deepest first)
     local total=0 ok=0 fail=0
     while IFS='|' read -r path remote branch _; do
-        # Skip comments and blank lines
         path=$(echo "$path" | xargs)
         [[ -z "$path" || "$path" == \#* ]] && continue
         remote=$(echo "$remote" | xargs)
@@ -239,7 +420,7 @@ main() {
         else
             (( fail++ ))
         fi
-    done < "$REPOS_FILE"
+    done < <(build_repo_list)
 
     log "=== Done: ${total} repos processed — ${ok} ok, ${fail} failed ==="
 }
@@ -291,6 +472,14 @@ PUSH_RETRY_DELAY=10
 
 # SSH key for git push (leave empty to use default SSH config)
 SSH_KEY=""
+
+# Auto-discover nested git repos under configured parent paths
+# When true, each run scans parent repos for child .git directories,
+# adds them to repos.conf, and updates the parent .gitignore
+AUTO_DISCOVER="true"
+
+# Max directory depth to scan for nested repos (default: 3)
+DISCOVER_DEPTH=3
 CONF
     fi
 
@@ -424,6 +613,7 @@ show_summary() {
     echo "  Commands:"
     echo "    sudo git-autopush manual    Run now (interactive)"
     echo "    sudo git-autopush list      Show configured repos"
+    echo "    sudo git-autopush discover  Scan for sub-repos and add them"
     echo "    systemctl status git-autopush.timer   Check schedule"
     echo "    journalctl -u git-autopush.service    View systemd logs"
     echo ""
